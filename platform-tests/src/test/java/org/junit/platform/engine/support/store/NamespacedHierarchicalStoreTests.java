@@ -416,6 +416,47 @@ public class NamespacedHierarchicalStoreTests {
 			assertEquals(1, counter.get());
 			assertThat(values).hasSize(threads).containsOnly(1);
 		}
+
+		@Test
+		void simulateRaceConditionInComputeIfAbsent_whenLocalNullPresent() throws Exception {
+			int threads = 10;
+			AtomicInteger counter = new AtomicInteger();
+			List<Object> values;
+
+			try (var localStore = new NamespacedHierarchicalStore<>(null)) {
+				// Put an explicit local null value to exercise the branch that replaces
+				// local mappings that evaluate to null.
+				localStore.put(namespace, key, null);
+
+				values = executeConcurrently(threads, //
+					() -> requireNonNull(localStore.computeIfAbsent(namespace, key, it -> counter.incrementAndGet())));
+			}
+
+			// Only a single creation should happen and all concurrent callers should
+			// observe the same computed value.
+			assertEquals(1, counter.get());
+			assertThat(values).hasSize(threads).containsOnly(1);
+		}
+
+		@Test
+		void simulateRaceConditionInComputeIfAbsent_whenParentNullPresent() throws Exception {
+			int threads = 10;
+			AtomicInteger counter = new AtomicInteger();
+			List<Object> values;
+
+			try (var parent = new NamespacedHierarchicalStore<String>(null)) {
+				var child = parent.newChild();
+
+				// Put an explicit null value in the parent store so child's computeIfAbsent must ingest/replace it.
+				parent.put(namespace, key, null);
+
+				values = executeConcurrently(threads, //
+					() -> requireNonNull(child.computeIfAbsent(namespace, key, it -> counter.incrementAndGet())));
+			}
+
+			assertEquals(1, counter.get());
+			assertThat(values).hasSize(threads).containsOnly(1);
+		}
 	}
 
 	@Nested

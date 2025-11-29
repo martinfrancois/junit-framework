@@ -244,18 +244,39 @@ public final class NamespacedHierarchicalStore<N> implements AutoCloseable {
 		StoredValue storedValue = getStoredValue(compositeKey);
 		var result = StoredValue.evaluateIfNotNull(storedValue);
 		if (result == null) {
-			StoredValue newStoredValue = this.storedValues.compute(compositeKey, (__, oldStoredValue) -> {
-				if (StoredValue.evaluateIfNotNull(oldStoredValue) == null) {
+			// First try to ensure there's a memoizing supplier in-place using computeIfAbsent; this prevents
+			// multiple threads from racing to create separate stored values for the same key.
+			StoredValue existingOrInserted = this.storedValues.computeIfAbsent(compositeKey, __ -> {
+				rejectIfClosed();
+				return newStoredValue(new MemoizingSupplier(() -> {
 					rejectIfClosed();
-					var computedValue = Preconditions.notNull(defaultCreator.apply(key),
-						"defaultCreator must not return null");
-					return newStoredValue(() -> {
-						rejectIfClosed();
-						return computedValue;
-					});
-				}
-				return oldStoredValue;
+					return Preconditions.notNull(defaultCreator.apply(key), "defaultCreator must not return null");
+				}));
 			});
+
+			// If the value we found/inserted evaluates to null and it's not already a MemoizingSupplier (e.g., it was
+			// a previously stored constant null), try to replace it atomically with a new MemoizingSupplier. We use
+			// a CAS-style replace to ensure only one thread wins the replacement.
+			StoredValue newStoredValue = existingOrInserted;
+			if (StoredValue.evaluateIfNotNull(existingOrInserted) == null) {
+				// If the existing stored value is already memoizing, reuse it — that means another thread is already
+				// working on the computation and we should observe the result when it finishes.
+				if (!(existingOrInserted.supplier() instanceof MemoizingSupplier)) {
+					StoredValue replacement = newStoredValue(new MemoizingSupplier(() -> {
+						rejectIfClosed();
+						return Preconditions.notNull(defaultCreator.apply(key), "defaultCreator must not return null");
+					}));
+
+					// Try to replace the existing value atomically; if it fails, some other thread changed it and
+					// we'll read whatever is now present.
+					if (this.storedValues.replace(compositeKey, existingOrInserted, replacement)) {
+						newStoredValue = replacement;
+					}
+					else {
+						newStoredValue = this.storedValues.get(compositeKey);
+					}
+				}
+			}
 			return requireNonNull(newStoredValue.evaluate());
 		}
 		return result;
